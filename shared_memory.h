@@ -1,9 +1,10 @@
 #ifndef SHARED_MEMORY_H
 #define SHARED_MEMORY_H
 
-void init_shared_memory();
-int *attach_shared_memory();
+extern int shm_id;
+
+void setup_shared_memory();
+void attach_shared_memory(int **shared_clock_sec, int **shared_clock_ns);
 void detach_shared_memory();
-void cleanup_shared_memory();
 
 #endif
