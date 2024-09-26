@@ -1,18 +1,27 @@
+# Compiler and flags
 CC = gcc
 CFLAGS = -Wall -g
-OBJ = oss.o worker.o shared_memory.o
-DEPS = shared_memory.h
 
+# Executables
 all: oss worker
 
-%.o: %.c $(DEPS)
-	$(CC) -c -o $@ $< $(CFLAGS)
+oss: oss.o
+	$(CC) $(CFLAGS) -o oss oss.o
 
-oss: oss.o shared_memory.o
-	$(CC) -o oss oss.o shared_memory.o $(CFLAGS)
+worker: worker.o
+	$(CC) $(CFLAGS) -o worker worker.o
 
-worker: worker.o shared_memory.o
-	$(CC) -o worker worker.o shared_memory.o $(CFLAGS)
+# To obtain object files
+oss.o: oss.c
+	$(CC) $(CFLAGS) -c oss.c
 
+worker.o: worker.c
+	$(CC) $(CFLAGS) -c worker.c
+
+# Clean up
 clean:
 	rm -f *.o oss worker
+
+# Phony targets
+.PHONY: all clean
+
