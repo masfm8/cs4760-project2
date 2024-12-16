@@ -6,164 +6,161 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <time.h>
+#include <stdbool.h>
 
 #define SHMKEY 9876
-#define MAX_PROCS 20
-#define TIME_INCREMENT 1000000 // Simulated clock increment in nanoseconds
+#define MAX_PROCESSES 20
+#define CLOCK_INCREMENT 1000000 // 1 millisecond in nanoseconds
 
-struct ProcessControlBlock {
-    int active;
+struct PCB {
+    int occupied;
     pid_t pid;
-    int startSec;
+    int startSeconds;
     int startNano;
 };
 
-int shm_id;
-int *sharedClock;
-struct ProcessControlBlock procTable[MAX_PROCS];
+// Global variables
+int shmid;
+int *shmClock;
+struct PCB processTable[MAX_PROCESSES];
 
-void handleSignal(int signal) {
-    if (signal == SIGINT) {
-        printf("OSS: Terminating due to SIGINT. Cleaning up shared memory.\n");
-        shmdt(sharedClock);
-        shmctl(shm_id, IPC_RMID, NULL);
+void sig_handler(int signo) {
+    if (signo == SIGINT) {
+        printf("OSS: Received SIGINT. Cleaning up.\n");
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            if (processTable[i].occupied) {
+                kill(processTable[i].pid, SIGTERM);
+            }
+        }
+        shmdt(shmClock);
+        shmctl(shmid, IPC_RMID, NULL);
         exit(0);
     }
 }
 
 void initProcessTable() {
-    for (int i = 0; i < MAX_PROCS; i++) {
-        procTable[i].active = 0;
-        procTable[i].pid = 0;
-        procTable[i].startSec = 0;
-        procTable[i].startNano = 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        processTable[i].occupied = 0;
+        processTable[i].pid = 0;
+        processTable[i].startSeconds = 0;
+        processTable[i].startNano = 0;
     }
 }
 
-int getFreeSlot() {
-    for (int i = 0; i < MAX_PROCS; i++) {
-        if (procTable[i].active == 0) {
+int findAvailableSlot() {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (processTable[i].occupied == 0) {
             return i;
         }
     }
     return -1;
 }
 
-void incrementClock(int nanoIncrement) {
-    sharedClock[1] += nanoIncrement;
-    if (sharedClock[1] >= 1000000000) {
-        sharedClock[0] += 1;
-        sharedClock[1] -= 1000000000;
+void incrementClock(int incrementNano) {
+    shmClock[1] += incrementNano;
+    if (shmClock[1] >= 1000000000) {
+        shmClock[0]++;
+        shmClock[1] -= 1000000000;
     }
 }
 
 int main(int argc, char *argv[]) {
-    signal(SIGINT, handleSignal);
+    signal(SIGINT, sig_handler);
 
-    int maxProcesses = 5, maxSimultaneous = 3, timeLimitForWorkers = 5, intervalMs = 100;
+    int maxProcesses = 5;
+    int maxSimultaneous = 3;
+    int timeLimitForChildren = 5;
+    int intervalInMsToLaunchChildren = 100;
+
     int opt;
     while ((opt = getopt(argc, argv, "n:s:t:i:")) != -1) {
         switch (opt) {
-            case 'n':
-                maxProcesses = atoi(optarg);
-                break;
-            case 's':
-                maxSimultaneous = atoi(optarg);
-                break;
-            case 't':
-                timeLimitForWorkers = atoi(optarg);
-                break;
-            case 'i':
-                intervalMs = atoi(optarg);
-                break;
+            case 'n': maxProcesses = atoi(optarg); break;
+            case 's': maxSimultaneous = atoi(optarg); break;
+            case 't': timeLimitForChildren = atoi(optarg); break;
+            case 'i': intervalInMsToLaunchChildren = atoi(optarg); break;
             default:
-                fprintf(stderr, "Usage: %s [-n maxProcesses] [-s maxSimultaneous] [-t timeLimitForWorkers] [-i intervalMs]\n", argv[0]);
-                exit(EXIT_FAILURE);
+                printf("Usage: %s [-n maxProcesses] [-s maxSimultaneous] [-t timeLimit] [-i interval]\n", argv[0]);
+                exit(1);
         }
     }
 
-    shm_id = shmget(SHMKEY, 2 * sizeof(int), IPC_CREAT | 0666);
-    if (shm_id == -1) {
+    shmid = shmget(SHMKEY, 2 * sizeof(int), IPC_CREAT | 0666);
+    if (shmid == -1) {
         perror("oss: shmget");
-        exit(EXIT_FAILURE);
+        exit(1);
     }
 
-    sharedClock = (int *)shmat(shm_id, NULL, 0);
-    if (sharedClock == (int *)-1) {
+    shmClock = (int *)shmat(shmid, NULL, 0);
+    if (shmClock == (int *)-1) {
         perror("oss: shmat");
-        exit(EXIT_FAILURE);
+        exit(1);
     }
+    shmClock[0] = 0; shmClock[1] = 0;
 
-    sharedClock[0] = 0;
-    sharedClock[1] = 0;
     initProcessTable();
 
-    int runningProcesses = 0, totalLaunched = 0;
-    time_t startTime = time(NULL);
+    int numProcesses = 0;
+    int launchedProcesses = 0;
+    int lastLaunchTimeS = shmClock[0];
+    int lastLaunchTimeN = shmClock[1];
 
-    while (totalLaunched < maxProcesses) {
-        incrementClock(TIME_INCREMENT);
+    while (launchedProcesses < maxProcesses || numProcesses > 0) {
+        incrementClock(CLOCK_INCREMENT);
 
         int status;
-        pid_t terminatedPid = waitpid(-1, &status, WNOHANG);
-        if (terminatedPid > 0) {
-            for (int i = 0; i < MAX_PROCS; i++) {
-                if (procTable[i].pid == terminatedPid) {
-                    procTable[i].active = 0;
-                    printf("OSS: Process PID %d finished.\n", terminatedPid);
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+        if (pid > 0) {
+            for (int i = 0; i < MAX_PROCESSES; i++) {
+                if (processTable[i].pid == pid) {
+                    processTable[i].occupied = 0;
+                    numProcesses--;
+                    printf("OSS: Process PID %d terminated.\n", pid);
                     break;
                 }
             }
         }
 
-        if (runningProcesses < maxSimultaneous && totalLaunched < maxProcesses) {
-            int slot = getFreeSlot();
+        int timeSinceLastLaunch = (shmClock[0] - lastLaunchTimeS) * 1000 + 
+                                  (shmClock[1] - lastLaunchTimeN) / 1000000;
+
+        if (timeSinceLastLaunch >= intervalInMsToLaunchChildren &&
+            numProcesses < maxSimultaneous &&
+            launchedProcesses < maxProcesses) {
+            int slot = findAvailableSlot();
             if (slot != -1) {
                 pid_t childPid = fork();
                 if (childPid == 0) {
-                    char stayTime[10];
-                    snprintf(stayTime, 10, "%d", rand() % timeLimitForWorkers + 1);
-                    execl("./worker", "worker", stayTime, NULL);
+                    usleep(500);
+                    char timeToStay[10];
+                    snprintf(timeToStay, 10, "%d", rand() % timeLimitForChildren + 1);
+                    execl("./worker", "worker", timeToStay, NULL);
                     perror("oss: execl");
                     exit(1);
                 } else if (childPid > 0) {
-                    procTable[slot].active = 1;
-                    procTable[slot].pid = childPid;
-                    procTable[slot].startSec = sharedClock[0];
-                    procTable[slot].startNano = sharedClock[1];
-                    runningProcesses++;
-                    totalLaunched++;
-                    printf("OSS: Launched process PID %d\n", childPid);
+                    processTable[slot].occupied = 1;
+                    processTable[slot].pid = childPid;
+                    processTable[slot].startSeconds = shmClock[0];
+                    processTable[slot].startNano = shmClock[1];
+                    numProcesses++;
+                    launchedProcesses++;
+                    lastLaunchTimeS = shmClock[0];
+                    lastLaunchTimeN = shmClock[1];
+                    printf("OSS: Launched worker process PID %d\n", childPid);
                 } else {
                     perror("oss: fork");
                 }
             }
         }
-
-        if (sharedClock[1] % 500000000 == 0) {
-            printf("OSS: Simulated time %ds %dns\n", sharedClock[0], sharedClock[1]);
-            printf("Process Table:\n");
-            for (int i = 0; i < MAX_PROCS; i++) {
-                if (procTable[i].active) {
-                    printf("Slot %d: Active: %d PID: %d StartSec: %d StartNano: %d\n", i, procTable[i].active, procTable[i].pid, procTable[i].startSec, procTable[i].startNano);
-                }
-            }
-        }
-
-        if (difftime(time(NULL), startTime) > 60) {
-            printf("OSS: 60 seconds passed. Terminating workers.\n");
-            for (int i = 0; i < MAX_PROCS; i++) {
-                if (procTable[i].active) {
-                    kill(procTable[i].pid, SIGTERM);
-                }
-            }
-            break;
-        }
-
-        usleep(intervalMs * 1000);
     }
 
-    shmdt(sharedClock);
-    shmctl(shm_id, IPC_RMID, NULL);
+    printf("OSS: All workers complete. Cleaning up shared memory.\n");
+    shmdt(shmClock);
+    if (shmctl(shmid, IPC_RMID, NULL) == -1) {
+        perror("oss: Failed to remove shared memory");
+    } else {
+        printf("OSS: Shared memory successfully removed.\n");
+    }
+
     return 0;
 }
